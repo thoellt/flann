@@ -37,6 +37,10 @@
 #include <cstring>
 #include <stdarg.h>
 #include <cmath>
+#include <future>
+#include <numeric>
+#include <mutex>
+
 
 #include "flann/general.h"
 #include "flann/algorithms/nn_index.h"
@@ -57,7 +61,7 @@ struct KDTreeIndexParams : public IndexParams
     KDTreeIndexParams(int trees = 4)
     {
         (*this)["algorithm"] = FLANN_INDEX_KDTREE;
-        (*this)["trees"] = trees;
+	(*this)["trees"] = trees;
     }
 };
 
@@ -88,7 +92,7 @@ public:
      *          params = parameters passed to the kdtree algorithm
      */
     KDTreeIndex(const IndexParams& params = KDTreeIndexParams(), Distance d = Distance() ) :
-    	BaseClass(params, d), mean_(NULL), var_(NULL)
+        BaseClass(params, d)
     {
         trees_ = get_param(index_params_,"trees",4);
     }
@@ -102,7 +106,7 @@ public:
      *          params = parameters passed to the kdtree algorithm
      */
     KDTreeIndex(const Matrix<ElementType>& dataset, const IndexParams& params = KDTreeIndexParams(),
-                Distance d = Distance() ) : BaseClass(params,d ), mean_(NULL), var_(NULL)
+                Distance d = Distance() ) : BaseClass(params,d )
     {
         trees_ = get_param(index_params_,"trees",4);
 
@@ -252,24 +256,29 @@ protected:
      */
     void buildIndexImpl()
     {
-        // Create a permutable array of indices to the input vectors.
-    	std::vector<int> ind(size_);
-        for (size_t i = 0; i < size_; ++i) {
-            ind[i] = int(i);
-        }
+	// Create a permutable array of indices to the input vectors.
+	std::vector<std::vector<int>> ind(trees_, std::vector<int>(size_));
+	for (int i = 0; i < trees_; ++i) {
+	    std::iota(ind[i].begin(),ind[i].end(),0);
+	    /* Randomize the order of vectors to allow for unbiased sampling. */
+	    std::random_shuffle(ind[i].begin(), ind[i].end());
+	}
 
-        mean_ = new DistanceType[veclen_];
-        var_ = new DistanceType[veclen_];
+	tree_roots_.resize(trees_);
+	std::vector<std::future<NodePtr>> futures(trees_);
+	pooled_allocators_.reserve(50);
 
-        tree_roots_.resize(trees_);
-        /* Construct the randomized trees. */
-        for (int i = 0; i < trees_; i++) {
-            /* Randomize the order of vectors to allow for unbiased sampling. */
-            std::random_shuffle(ind.begin(), ind.end());
-            tree_roots_[i] = divideTree(&ind[0], int(size_) );
+	/* Construct the randomized trees. */
+	for (int i = 0; i < trees_; i++) {
+	    mutex_pool_.lock();
+	    pooled_allocators_.push_back(PooledAllocator());
+	    futures[i] = std::async(std::launch::async, [](KDTreeIndex* tree, int* ptr, int count, PooledAllocator* allocator){ return tree->divideTree(ptr, count, allocator); }, this, &ind[i][0], int(size_), &(pooled_allocators_[pooled_allocators_.size()-1]));
+	    mutex_pool_.unlock();
+	}
+	for (int i = 0; i < trees_; i++) {
+	    futures[i].wait();
+	    tree_roots_[i] = futures[i].get();
         }
-        delete[] mean_;
-        delete[] var_;
     }
 
     void freeIndex()
@@ -376,9 +385,10 @@ private:
      *                  first = index of the first vector
      *                  last = index of the last vector
      */
-    NodePtr divideTree(int* ind, int count)
+    NodePtr divideTree(int* ind, int count, PooledAllocator* allocator)
     {
-        NodePtr node = new(pool_) Node(); // allocate memory
+
+	NodePtr node = new(*allocator) Node(); // allocate memory
 
         /* If too few exemplars remain, then make this a leaf node. */
         if (count == 1) {
@@ -394,8 +404,17 @@ private:
 
             node->divfeat = cutfeat;
             node->divval = cutval;
-            node->child1 = divideTree(ind, idx);
-            node->child2 = divideTree(ind+idx, count-idx);
+
+	    //std::future<NodePtr> future = std::async(std::launch::async, [](KDTreeIndex* tree, int* ptr, int count){ return tree->divideTree(ptr, count); }, this, &ind[0], int(size_) );
+//	    if(depth == 3){//TODO
+	        node->child1 = divideTree(ind, idx, allocator);
+		node->child2 = divideTree(ind+idx, count-idx, allocator);
+/*	    }
+	    else {
+		node->child1 = divideTree(ind, idx);
+		node->child2 = divideTree(ind+idx, count-idx);
+	    }
+	    */
         }
 
         return node;
@@ -409,8 +428,9 @@ private:
      */
     void meanSplit(int* ind, int count, int& index, int& cutfeat, DistanceType& cutval)
     {
-        memset(mean_,0,veclen_*sizeof(DistanceType));
-        memset(var_,0,veclen_*sizeof(DistanceType));
+
+	std::vector<DistanceType> mean(veclen_,0);
+	std::vector<DistanceType> var(veclen_,0);
 
         /* Compute mean values.  Only the first SAMPLE_MEAN values need to be
             sampled to get a good estimate.
@@ -419,25 +439,25 @@ private:
         for (int j = 0; j < cnt; ++j) {
             ElementType* v = points_[ind[j]];
             for (size_t k=0; k<veclen_; ++k) {
-                mean_[k] += v[k];
+		mean[k] += v[k];
             }
         }
         DistanceType div_factor = DistanceType(1)/cnt;
         for (size_t k=0; k<veclen_; ++k) {
-            mean_[k] *= div_factor;
+	    mean[k] *= div_factor;
         }
 
         /* Compute variances (no need to divide by count). */
         for (int j = 0; j < cnt; ++j) {
             ElementType* v = points_[ind[j]];
             for (size_t k=0; k<veclen_; ++k) {
-                DistanceType dist = v[k] - mean_[k];
-                var_[k] += dist * dist;
+		DistanceType dist = v[k] - mean[k];
+		var[k] += dist * dist;
             }
         }
         /* Select one of the highest variance indices at random. */
-        cutfeat = selectDivision(var_);
-        cutval = mean_[cutfeat];
+	cutfeat = selectDivision(var.data());
+	cutval = mean[cutfeat];
 
         int lim1, lim2;
         planeSplit(ind, count, cutfeat, cutval, lim1, lim2);
@@ -740,9 +760,6 @@ private:
      */
     int trees_;
 
-    DistanceType* mean_;
-    DistanceType* var_;
-
     /**
      * Array of k-d trees used to find neighbours.
      */
@@ -756,6 +773,9 @@ private:
      * number small of memory allocations.
      */
     PooledAllocator pool_;
+    std::vector<PooledAllocator> pooled_allocators_ ;
+
+    std::mutex mutex_pool_;
 
     USING_BASECLASS_SYMBOLS
 };   // class KDTreeIndex
