@@ -36,4 +36,9 @@ endif()
 
 
 
+add_executable(flann_example_random_data_cpp flann_example_random_data.cpp)
+target_link_libraries(flann_example_random_data_cpp flann)
+set_target_properties(flann_example_random_data_cpp PROPERTIES COMPILE_FLAGS -std=c99)
 
+add_dependencies(examples flann_example_random_data_cpp)
+install (TARGETS flann_example_random_data_cpp DESTINATION bin )
