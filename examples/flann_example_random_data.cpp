@@ -14,8 +14,9 @@ int main(int argc, char** argv)
     std::chrono::time_point<std::chrono::system_clock> start, end;
 
     int nn = 3;
-    int n_dp = 1000000;
-    int n_dim = 1000;
+    int n_dp = 35000000;
+    //int n_dp = 3500;
+    int n_dim = 40;
 
     std::vector<float>  data(n_dim*n_dp,0);
     std::vector<int>    indices_mem(n_dp*nn,0);
@@ -39,6 +40,7 @@ int main(int argc, char** argv)
     end = std::chrono::system_clock::now();
     std::chrono::duration<double> elapsed_seconds = end-start;
     std::cout << "elapsed time: " << elapsed_seconds.count() << "s\n";
+    std::cout << "memory: " << index.usedMemory() << "\n";
 
     // do a knn search, using 128 checks
     //index.knnSearch(query, indices, dists, nn, flann::SearchParams(128));

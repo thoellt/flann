@@ -40,6 +40,8 @@
 #include <future>
 #include <numeric>
 #include <mutex>
+#include <queue>
+#include "omp.h"
 
 
 #include "flann/general.h"
@@ -58,10 +60,11 @@ namespace flann
 
 struct KDTreeIndexParams : public IndexParams
 {
-    KDTreeIndexParams(int trees = 4)
+    KDTreeIndexParams(int trees = 4, int cores = 0)
     {
         (*this)["algorithm"] = FLANN_INDEX_KDTREE;
 	(*this)["trees"] = trees;
+	(*this)["cores"] = cores;
     }
 };
 
@@ -109,6 +112,7 @@ public:
                 Distance d = Distance() ) : BaseClass(params,d )
     {
         trees_ = get_param(index_params_,"trees",4);
+	cores_ = get_param(index_params_,"cores",0);
 
         setDataset(dataset);
     }
@@ -171,6 +175,8 @@ public:
     template<typename Archive>
     void serialize(Archive& ar)
     {
+	throw std::logic_error("serialize not implemented");
+	/*
     	ar.setObject(this);
 
     	ar & *static_cast<NNIndex<Distance>*>(this);
@@ -191,6 +197,7 @@ public:
             index_params_["algorithm"] = getType();
             index_params_["trees"] = trees_;
     	}
+	*/
     }
 
 
@@ -214,7 +221,12 @@ public:
      */
     int usedMemory() const
     {
-        return int(pool_.usedMemory+pool_.wastedMemory+size_*sizeof(int));  // pool memory and vind array memory
+	int used_memory = 0;
+	for(auto& allocator: pooled_allocators_){
+	    used_memory += allocator.usedMemory+allocator.wastedMemory+size_*sizeof(int);
+	}
+	return used_memory;
+	//return int(pool_.usedMemory+pool_.wastedMemory+size_*sizeof(int));  // pool memory and vind array memory
     }
 
     /**
@@ -264,21 +276,44 @@ protected:
 	    std::random_shuffle(ind[i].begin(), ind[i].end());
 	}
 
-	tree_roots_.resize(trees_);
-	std::vector<std::future<NodePtr>> futures(trees_);
-	pooled_allocators_.reserve(50);
-
-	/* Construct the randomized trees. */
-	for (int i = 0; i < trees_; i++) {
-	    mutex_pool_.lock();
-	    pooled_allocators_.push_back(PooledAllocator());
-	    futures[i] = std::async(std::launch::async, [](KDTreeIndex* tree, int* ptr, int count, PooledAllocator* allocator){ return tree->divideTree(ptr, count, allocator); }, this, &ind[i][0], int(size_), &(pooled_allocators_[pooled_allocators_.size()-1]));
-	    mutex_pool_.unlock();
+	int num_available_threads = cores_;
+	if(cores_ <= 0){
+	    num_available_threads = omp_get_max_threads();
 	}
-	for (int i = 0; i < trees_; i++) {
-	    futures[i].wait();
-	    tree_roots_[i] = futures[i].get();
-        }
+	if(num_available_threads > 1){
+	    std::cout << "#threads: " << num_available_threads << std::endl;
+	    int spawn_depth = std::ceil(std::log2(num_available_threads/trees_));
+	    std::cout << "depth: " << spawn_depth << std::endl;
+
+	    tree_roots_.resize(trees_);
+	    std::vector<std::future<NodePtr>> futures(trees_);
+	    pooled_allocators_.reserve(50);
+
+	    /* Construct the randomized trees. */
+	    for (int i = 0; i < trees_; i++) {
+		mutex_pool_.lock();
+		pooled_allocators_.push_back(PooledAllocator());
+		futures[i] = std::async(std::launch::async, [](KDTreeIndex* tree, int* ptr, int count, PooledAllocator* allocator, int spawn_depth){ return tree->divideTreeMultithreading(ptr, count, allocator, 1, spawn_depth); }, this, &ind[i][0], int(size_), &(pooled_allocators_.back()), spawn_depth);
+		mutex_pool_.unlock();
+	    }
+	    for (int i = 0; i < trees_; i++) {
+		futures[i].wait();
+		tree_roots_[i] = futures[i].get();
+	    }
+	    while(!thread_queue_.empty()){
+		auto& e = thread_queue_.front();
+		e.second.wait();
+		*e.first = e.second.get();
+		thread_queue_.pop();
+		std::cout << "POP" << std::endl;
+	    }
+	}else{
+	    pooled_allocators_.push_back(PooledAllocator());
+	    for (int i = 0; i < trees_; i++) {
+		tree_roots_.push_back(divideTree(&ind[i][0], int(size_), &(pooled_allocators_.back())));
+	    }
+	}
+
     }
 
     void freeIndex()
@@ -287,7 +322,10 @@ protected:
     		// using placement new, so call destructor explicitly
     		if (tree_roots_[i]!=NULL) tree_roots_[i]->~Node();
     	}
-    	pool_.free();
+	//pool_.free();
+	for(auto& allocator: pooled_allocators_){
+	  allocator.free();
+	}
     }
 
 
@@ -326,6 +364,8 @@ private:
     	template<typename Archive>
     	void serialize(Archive& ar)
     	{
+	    throw std::logic_error("serialize not implemented");
+	    /*
     		typedef KDTreeIndex<Distance> Index;
     		Index* obj = static_cast<Index*>(ar.getObject());
 
@@ -352,6 +392,7 @@ private:
     			ar & *child1;
     			ar & *child2;
     		}
+		*/
     	}
     	friend struct serialization::access;
     };
@@ -362,6 +403,8 @@ private:
 
     void copyTree(NodePtr& dst, const NodePtr& src)
     {
+	throw std::logic_error("copyTree not implemented");
+	/*
     	dst = new(pool_) Node();
     	dst->divfeat = src->divfeat;
     	dst->divval = src->divval;
@@ -374,6 +417,7 @@ private:
     		copyTree(dst->child1, src->child1);
     		copyTree(dst->child2, src->child2);
     	}
+	*/
     }
 
     /**
@@ -390,34 +434,76 @@ private:
 
 	NodePtr node = new(*allocator) Node(); // allocate memory
 
-        /* If too few exemplars remain, then make this a leaf node. */
-        if (count == 1) {
-            node->child1 = node->child2 = NULL;    /* Mark as leaf node. */
-            node->divfeat = *ind;    /* Store index of this vec. */
-            node->point = points_[*ind];
-        }
-        else {
-            int idx;
-            int cutfeat;
-            DistanceType cutval;
-            meanSplit(ind, count, idx, cutfeat, cutval);
+	/* If too few exemplars remain, then make this a leaf node. */
+	if (count == 1) {
+	    node->child1 = node->child2 = NULL;    /* Mark as leaf node. */
+	    node->divfeat = *ind;    /* Store index of this vec. */
+	    node->point = points_[*ind];
+	}
+	else {
+	    int idx;
+	    int cutfeat;
+	    DistanceType cutval;
+	    meanSplit(ind, count, idx, cutfeat, cutval);
 
-            node->divfeat = cutfeat;
-            node->divval = cutval;
+	    node->divfeat = cutfeat;
+	    node->divval = cutval;
 
-	    //std::future<NodePtr> future = std::async(std::launch::async, [](KDTreeIndex* tree, int* ptr, int count){ return tree->divideTree(ptr, count); }, this, &ind[0], int(size_) );
-//	    if(depth == 3){//TODO
-	        node->child1 = divideTree(ind, idx, allocator);
-		node->child2 = divideTree(ind+idx, count-idx, allocator);
-/*	    }
-	    else {
-		node->child1 = divideTree(ind, idx);
-		node->child2 = divideTree(ind+idx, count-idx);
+	    node->child1 = divideTree(ind, idx, allocator);
+	    node->child2 = divideTree(ind+idx, count-idx, allocator);
+	}
+
+	return node;
+    }
+
+
+    /**
+     * Create a tree node that subdivides the list of vecs from vind[first]
+     * to vind[last].  The routine is called recursively on each sublist.
+     * Place a pointer to this new tree node in the location pTree.
+     *
+     * Params: pTree = the new node to create
+     *                  first = index of the first vector
+     *                  last = index of the last vector
+     */
+    NodePtr divideTreeMultithreading(int* ind, int count, PooledAllocator* allocator, int depth, int spawn_depth)
+    {
+
+	NodePtr node = new(*allocator) Node(); // allocate memory
+
+	/* If too few exemplars remain, then make this a leaf node. */
+	if (count == 1) {
+	    node->child1 = node->child2 = NULL;    /* Mark as leaf node. */
+	    node->divfeat = *ind;    /* Store index of this vec. */
+	    node->point = points_[*ind];
+	}
+	else {
+	    int idx;
+	    int cutfeat;
+	    DistanceType cutval;
+	    meanSplit(ind, count, idx, cutfeat, cutval);
+
+	    node->divfeat = cutfeat;
+	    node->divval = cutval;
+
+	    if(depth <= spawn_depth){
+		mutex_pool_.lock();
+		pooled_allocators_.push_back(PooledAllocator());
+		thread_queue_.push(std::pair<NodePtr*,std::future<NodePtr>>(&node->child1, std::async(std::launch::async, [](KDTreeIndex* tree, int* ptr, int count, PooledAllocator* allocator, int depth, int spawn_depth){ return tree->divideTreeMultithreading(ptr, count, allocator, depth, spawn_depth); },
+		                                                            this, ind, idx, &(pooled_allocators_.back()), depth+1, spawn_depth)));
+
+		pooled_allocators_.push_back(PooledAllocator());
+		thread_queue_.push(std::pair<NodePtr*,std::future<NodePtr>>(&node->child2, std::async(std::launch::async, [](KDTreeIndex* tree, int* ptr, int count, PooledAllocator* allocator, int depth, int spawn_depth){ return tree->divideTreeMultithreading(ptr, count, allocator, depth, spawn_depth); },
+		                                                            this, ind+idx, count-idx, &(pooled_allocators_.back()), depth+1, spawn_depth)));
+		mutex_pool_.unlock();
 	    }
-	    */
-        }
+	    else{
+		node->child1 = divideTreeMultithreading(ind, idx, allocator, depth+1, spawn_depth);
+		node->child2 = divideTreeMultithreading(ind+idx, count-idx, allocator, depth+1, spawn_depth);
+	    }
+	}
 
-        return node;
+	return node;
     }
 
 
@@ -681,6 +767,8 @@ private:
     
     void addPointToTree(NodePtr node, int ind)
     {
+	throw std::logic_error("addPointToTree not implemented");
+	/*
         ElementType* point = points_[ind];
         
         if ((node->child1==NULL) && (node->child2==NULL)) {
@@ -724,14 +812,18 @@ private:
                 addPointToTree(node->child2,ind);                
             }
         }
+	*/
     }
 private:
     void swap(KDTreeIndex& other)
     {
+	throw std::logic_error("swap not implemented");
+	/*
     	BaseClass::swap(other);
     	std::swap(trees_, other.trees_);
     	std::swap(tree_roots_, other.tree_roots_);
     	std::swap(pool_, other.pool_);
+	*/
     }
 
 private:
@@ -761,6 +853,11 @@ private:
     int trees_;
 
     /**
+     * Number of cores used in the construction of the trees
+     */
+    int cores_;
+
+    /**
      * Array of k-d trees used to find neighbours.
      */
     std::vector<NodePtr> tree_roots_;
@@ -772,9 +869,9 @@ private:
      * than allocating memory directly when there is a large
      * number small of memory allocations.
      */
-    PooledAllocator pool_;
+    //PooledAllocator pool_;
     std::vector<PooledAllocator> pooled_allocators_ ;
-
+    std::queue<std::pair<NodePtr*,std::future<NodePtr>>> thread_queue_;
     std::mutex mutex_pool_;
 
     USING_BASECLASS_SYMBOLS
